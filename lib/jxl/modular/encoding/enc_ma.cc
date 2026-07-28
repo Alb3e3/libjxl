@@ -239,8 +239,10 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
     {
       size_t pred = tree_samples.PredictorIndex((*tree)[pos].predictor);
       base_bits =
-          EstimateBits(counts.data() + pred * max_symbols, max_symbols) +
-          tot_extra_bits[pred];
+          tree_samples.PredictorOverflowed(pred)
+              ? std::numeric_limits<float>::max()
+              : EstimateBits(counts.data() + pred * max_symbols, max_symbols) +
+                    tot_extra_bits[pred];
     }
 
     SplitInfo *best = &best_split_nonstatic;
@@ -347,6 +349,9 @@ void FindBestSplit(TreeSamples &tree_samples, float threshold,
         costs_r.resize(last_used - first_used);
         // For all predictors, compute the right and left costs of each split.
         for (size_t pred = 0; pred < num_predictors; pred++) {
+          // A predictor that overflowed pixel_type on any sample cannot encode
+          // the channel; never let the search choose it.
+          if (tree_samples.PredictorOverflowed(pred)) continue;
           // Compute cost and histogram increments for each property value.
           const std::vector<ResidualToken> &rtokens =
               tree_samples.RTokens(pred);
@@ -516,10 +521,23 @@ Status ComputeBestTree(TreeSamples &tree_samples, float threshold,
   // TODO(veluca): take into account that different contexts can have different
   // uint configs.
   //
-  // Initialize tree.
+  // Initialize tree. Pick the first predictor that can actually encode the
+  // channel: a leaf that never splits keeps this predictor, so it must not be
+  // one whose residuals overflow pixel_type. If every candidate predictor
+  // overflows, fall back to Zero, whose residual is the pixel value itself and
+  // therefore always fits (this is what makes high-dynamic-range float input
+  // encodable at all); the reference implementation exposes the same escape via
+  // the Zero modular predictor option.
+  Predictor root_predictor = Predictor::Zero;
+  for (size_t i = 0; i < tree_samples.NumPredictors(); i++) {
+    if (!tree_samples.PredictorOverflowed(i)) {
+      root_predictor = tree_samples.PredictorFromIndex(i);
+      break;
+    }
+  }
   tree->emplace_back();
   tree->back().property = -1;
-  tree->back().predictor = tree_samples.PredictorFromIndex(0);
+  tree->back().predictor = root_predictor;
   tree->back().predictor_offset = 0;
   tree->back().multiplier = 1;
   JXL_ENSURE(tree_samples.NumProperties() < 64);
@@ -542,6 +560,7 @@ Status TreeSamples::SetPredictor(Predictor predictor,
   if (wp_tree_mode == ModularOptions::TreeMode::kWPOnly) {
     predictors = {Predictor::Weighted};
     residuals.resize(1);
+    predictor_overflow.assign(1, 0);
     return true;
   }
   if (wp_tree_mode == ModularOptions::TreeMode::kNoWP &&
@@ -565,6 +584,7 @@ Status TreeSamples::SetPredictor(Predictor predictor,
         predictors.end());
   }
   residuals.resize(predictors.size());
+  predictor_overflow.assign(predictors.size(), 0);
   return true;
 }
 
@@ -720,7 +740,14 @@ bool TreeSamples::IsSameSample(size_t a, size_t b) const {
 void TreeSamples::AddSample(pixel_type_w pixel, const Properties &properties,
                             const pixel_type_w *predictions) {
   for (size_t i = 0; i < predictors.size(); i++) {
-    pixel_type v = pixel - predictions[static_cast<int>(predictors[i])];
+    pixel_type_w vw = pixel - predictions[static_cast<int>(predictors[i])];
+    pixel_type v = static_cast<pixel_type>(vw);
+    // A residual that does not fit in a pixel_type cannot be encoded with this
+    // predictor (the encoder would later fail with "Residual overflow"). Record
+    // that so the tree search never selects this predictor for the channel.
+    if (static_cast<pixel_type_w>(v) != vw) {
+      predictor_overflow[i] = 1;
+    }
     uint32_t tok, nbits, bits;
     HybridUintConfig(4, 1, 2).Encode(PackSigned(v), &tok, &nbits, &bits);
     JXL_DASSERT(tok < 256);

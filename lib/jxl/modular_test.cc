@@ -486,6 +486,55 @@ TEST(ModularTest, RoundtripLosslessCustomFloat) {
   JXL_EXPECT_OK(SamePixels(*io->Main().color(), *io2->Main().color(), _));
 }
 
+TEST(ModularTest, RoundtripLosslessFloatMixedSign) {
+  // Lossless float32 data that mixes small negative and positive values makes
+  // the packed samples span most of the pixel_type range, so the Gradient and
+  // Weighted predictors produce residuals that do not fit in a pixel_type. The
+  // encoder used to select one of those predictors (its cost estimate silently
+  // truncated the residual) and then fail with "Residual overflow". The tree
+  // learner must instead fall back to a predictor whose residual fits, so that
+  // this input encodes and round-trips losslessly with the default predictors.
+  JxlMemoryManager* memory_manager = jxl::test::MemoryManager();
+  auto io = jxl::make_unique<jxl::CodecInOut>(memory_manager);
+  size_t xsize = 64;
+  size_t ysize = 64;
+  ASSERT_TRUE(io->SetSize(xsize, ysize));
+  io->metadata.m.bit_depth.bits_per_sample = 32;
+  io->metadata.m.bit_depth.exponent_bits_per_sample = 8;
+  io->metadata.m.bit_depth.floating_point_sample = true;
+  io->metadata.m.modular_16_bit_buffer_sufficient = false;
+  ColorEncoding color_encoding;
+  color_encoding.Tf().SetTransferFunction(TransferFunction::kLinear);
+  color_encoding.SetColorSpace(ColorSpace::kRGB);
+  JXL_TEST_ASSIGN_OR_DIE(Image3F testimage,
+                         Image3F::Create(memory_manager, xsize, ysize));
+  for (size_t c = 0; c < 3; c++) {
+    for (size_t y = 0; y < ysize; y++) {
+      float* const JXL_RESTRICT row = testimage.PlaneRow(c, y);
+      for (size_t x = 0; x < xsize; x++) {
+        row[x] = ((x + y) & 1) ? -1e-6f : 0.25f;
+      }
+    }
+  }
+  ASSERT_TRUE(io->SetFromImage(std::move(testimage), color_encoding));
+  io->metadata.m.color_encoding = color_encoding;
+  io->metadata.m.SetIntensityTarget(255);
+
+  CompressParams cparams;
+  cparams.modular_mode = true;
+  cparams.color_transform = jxl::ColorTransform::kNone;
+  cparams.butteraugli_distance = 0.f;
+  // Leave cparams.options.predictor at its default so the tree learner is free
+  // to pick Gradient/Weighted; this is the configuration that used to fail.
+  extras::JXLDecompressParams dparams;
+
+  auto io2 = jxl::make_unique<jxl::CodecInOut>(memory_manager);
+  size_t compressed_size;
+  JXL_EXPECT_OK(
+      Roundtrip(io.get(), cparams, dparams, io2.get(), _, &compressed_size));
+  JXL_EXPECT_OK(SamePixels(*io->Main().color(), *io2->Main().color(), _));
+}
+
 void WriteHeaders(BitWriter* writer, size_t xsize, size_t ysize) {
   ASSERT_TRUE(writer->WithMaxBits(16, LayerType::Header, nullptr, [&] {
     writer->Write(8, 0xFF);

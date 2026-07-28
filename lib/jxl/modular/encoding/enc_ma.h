@@ -82,6 +82,13 @@ struct TreeSamples {
     JXL_DASSERT(index < predictors.size());
     return predictors[index];
   }
+  // Whether any collected sample produced a residual for this predictor that
+  // does not fit in a pixel_type (int32). Such a predictor cannot be used to
+  // losslessly encode the channel, so it must not be selected for the tree.
+  bool PredictorOverflowed(size_t index) const {
+    JXL_DASSERT(index < predictor_overflow.size());
+    return predictor_overflow[index] != 0;
+  }
   size_t PropertyFromIndex(size_t index) const {
     JXL_DASSERT(index < props_to_use.size());
     return props_to_use[index];
@@ -142,6 +149,9 @@ struct TreeSamples {
   std::vector<uint32_t> props_to_use;
   // List of predictors to use.
   std::vector<Predictor> predictors;
+  // Per-predictor flag: set when a sample residual did not fit in a
+  // pixel_type, meaning the predictor cannot be used to encode the channel.
+  std::vector<uint8_t> predictor_overflow;
   // Mapping property value -> quantized property value.
   static constexpr int32_t kPropertyRange = 511;
   std::array<std::vector<uint16_t>, kNumStaticProperties>
